@@ -536,16 +536,231 @@ func sqlSliceRefCount(t *testing.T, m *dbMeta, id uint64, size uint32) int {
 	return ref.Refs
 }
 
-type insertCountingLogger struct {
+func TestSQLiteCloneBatchesChunkRefUpdates(t *testing.T) {
+	metaClient, err := newSQLMeta("sqlite3", path.Join(t.TempDir(), "jfs-clone-batch-chunk-refs.db"), testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	m := metaClient.(*dbMeta)
+	t.Cleanup(func() { _ = m.Shutdown() })
+	if err := m.Reset(); err != nil {
+		t.Fatalf("reset meta: %s", err)
+	}
+	if err := m.Init(testFormat(), true); err != nil {
+		t.Fatalf("init meta: %s", err)
+	}
+
+	ctx := Background()
+	var src Ino
+	if st := m.Mknod(ctx, RootInode, "src", TypeFile, 0644, 022, 0, "", &src, nil); st != 0 {
+		t.Fatalf("mknod src: %s", st)
+	}
+	const (
+		numSlices = 60
+		perChunk  = numSlices / 2
+		sliceSize = uint32(4096)
+	)
+	slices := make([]uint64, numSlices)
+	for i := range slices {
+		if st := m.NewSlice(ctx, &slices[i]); st != 0 {
+			t.Fatalf("new slice %d: %s", i, st)
+		}
+		indx := uint32(i / perChunk)
+		off := uint32(i%perChunk) * sliceSize
+		if st := m.Write(ctx, src, indx, off, Slice{Id: slices[i], Size: sliceSize, Len: sliceSize}, time.Now()); st != 0 {
+			t.Fatalf("write slice %d: %s", i, st)
+		}
+	}
+	var srcChunk chunk
+	if ok, err := m.db.Where("inode = ? AND indx = ?", src, 0).Get(&srcChunk); err != nil || !ok {
+		t.Fatalf("get source chunk: found=%v err=%v", ok, err)
+	}
+	duplicatePos := uint32(perChunk) * sliceSize
+	srcChunk.Slices = append(srcChunk.Slices, marshalSlice(duplicatePos, slices[0], sliceSize, 0, sliceSize)...)
+	if _, err := m.db.Where("inode = ? AND indx = ?", src, 0).Cols("slices").Update(&srcChunk); err != nil {
+		t.Fatalf("append duplicate slice reference: %s", err)
+	}
+	if _, err := m.db.Where("chunkid = ?", slices[0]).Cols("refs").Update(&sliceRef{Refs: 2}); err != nil {
+		t.Fatalf("update duplicate source refcount: %s", err)
+	}
+
+	counter := &sqlStatementCountingLogger{
+		ContextLogger: m.db.Logger(),
+		table:         regexp.MustCompile(`(?i)^\s*UPDATE\s+` + regexp.QuoteMeta(m.tablePrefix) + `(chunk_ref)\b`),
+		counts:        make(map[string]int),
+	}
+	m.db.SetLogger(counter)
+	defer m.db.SetLogger(counter.ContextLogger)
+
+	var count, total uint64
+	if st := m.Clone(ctx, RootInode, src, RootInode, "clone", CLONE_MODE_PRESERVE_ATTR, 0, 1, &count, &total); st != 0 {
+		t.Fatalf("clone: %s", st)
+	}
+	if got, want := counter.counts["chunk_ref"], (numSlices+m.getTxnBatchNum()-1)/m.getTxnBatchNum(); got != want {
+		t.Fatalf("chunk_ref UPDATE statements: got %d, want %d for %d slices", got, want, numSlices)
+	}
+	for i, id := range slices {
+		want := 2
+		if i == 0 {
+			want = 4
+		}
+		if got := sqlSliceRefCount(t, m, id, sliceSize); got != want {
+			t.Fatalf("slice %d refs after clone: got %d, want %d", i, got, want)
+		}
+	}
+	m.OnMsg(DeleteSlice, func(args ...interface{}) error {
+		t.Fatalf("slice %d should still be referenced by the source file", args[0].(uint64))
+		return nil
+	})
+	var clone Ino
+	var cloneAttr Attr
+	if st := m.Lookup(ctx, RootInode, "clone", &clone, &cloneAttr, false); st != 0 {
+		t.Fatalf("lookup clone: %s", st)
+	}
+	if err := m.deleteChunk(clone, 0); err != nil {
+		t.Fatalf("delete cloned chunk: %s", err)
+	}
+	if err := m.deleteChunk(clone, 1); err != nil {
+		t.Fatalf("delete second cloned chunk: %s", err)
+	}
+	for i, id := range slices {
+		want := 1
+		if i == 0 {
+			want = 2
+		}
+		if got := sqlSliceRefCount(t, m, id, sliceSize); got != want {
+			t.Fatalf("slice %d refs after deleting clone chunk: got %d, want %d", i, got, want)
+		}
+	}
+}
+
+func TestSQLiteCloneKeepsChunkRefSizeMatch(t *testing.T) {
+	metaClient, err := newSQLMeta("sqlite3", path.Join(t.TempDir(), "jfs-clone-chunk-ref-size.db"), testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	m := metaClient.(*dbMeta)
+	t.Cleanup(func() { _ = m.Shutdown() })
+	if err := m.Reset(); err != nil {
+		t.Fatalf("reset meta: %s", err)
+	}
+	if err := m.Init(testFormat(), true); err != nil {
+		t.Fatalf("init meta: %s", err)
+	}
+
+	ctx := Background()
+	var src Ino
+	if st := m.Mknod(ctx, RootInode, "src", TypeFile, 0644, 022, 0, "", &src, nil); st != 0 {
+		t.Fatalf("mknod src: %s", st)
+	}
+	var matchingID, mismatchedID uint64
+	if st := m.NewSlice(ctx, &matchingID); st != 0 {
+		t.Fatalf("new matching slice: %s", st)
+	}
+	if st := m.NewSlice(ctx, &mismatchedID); st != 0 {
+		t.Fatalf("new mismatched slice: %s", st)
+	}
+	const sliceSize = uint32(4096)
+	if st := m.Write(ctx, src, 0, 0, Slice{Id: matchingID, Size: sliceSize, Len: sliceSize}, time.Now()); st != 0 {
+		t.Fatalf("write matching slice: %s", st)
+	}
+	const secondSliceSize = uint32(8192)
+	if st := m.Write(ctx, src, 0, sliceSize, Slice{Id: mismatchedID, Size: secondSliceSize, Len: secondSliceSize}, time.Now()); st != 0 {
+		t.Fatalf("write mismatched slice: %s", st)
+	}
+	wrongSize := secondSliceSize + 1
+	if _, err := m.db.Where("chunkid = ?", mismatchedID).Cols("size").Update(&sliceRef{Size: wrongSize}); err != nil {
+		t.Fatalf("corrupt source ref size for mismatch case: %s", err)
+	}
+
+	var count, total uint64
+	if st := m.Clone(ctx, RootInode, src, RootInode, "clone", CLONE_MODE_PRESERVE_ATTR, 0, 1, &count, &total); st != 0 {
+		t.Fatalf("clone: %s", st)
+	}
+	matchingRef := sliceRef{Id: matchingID}
+	if ok, err := m.db.Get(&matchingRef); err != nil || !ok {
+		t.Fatalf("get matching slice ref: found=%v err=%v", ok, err)
+	}
+	if matchingRef.Size != sliceSize || matchingRef.Refs != 2 {
+		t.Fatalf("matching slice ref after clone: got size=%d refs=%d, want size=%d refs=2", matchingRef.Size, matchingRef.Refs, sliceSize)
+	}
+	ref := sliceRef{Id: mismatchedID}
+	if ok, err := m.db.Get(&ref); err != nil || !ok {
+		t.Fatalf("get mismatched slice ref: found=%v err=%v", ok, err)
+	}
+	if ref.Size != wrongSize || ref.Refs != 1 {
+		t.Fatalf("slice ref after clone with size mismatch: got size=%d refs=%d, want size=%d refs=1", ref.Size, ref.Refs, wrongSize)
+	}
+}
+
+func TestSQLiteCloneChunkRefUpdateFailureRollsBack(t *testing.T) {
+	metaClient, err := newSQLMeta("sqlite3", path.Join(t.TempDir(), "jfs-clone-chunk-ref-rollback.db"), testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	m := metaClient.(*dbMeta)
+	t.Cleanup(func() { _ = m.Shutdown() })
+	if err := m.Reset(); err != nil {
+		t.Fatalf("reset meta: %s", err)
+	}
+	if err := m.Init(testFormat(), true); err != nil {
+		t.Fatalf("init meta: %s", err)
+	}
+
+	ctx := Background()
+	var src Ino
+	if st := m.Mknod(ctx, RootInode, "src", TypeFile, 0644, 022, 0, "", &src, nil); st != 0 {
+		t.Fatalf("mknod src: %s", st)
+	}
+	var id uint64
+	if st := m.NewSlice(ctx, &id); st != 0 {
+		t.Fatalf("new slice: %s", st)
+	}
+	const sliceSize = uint32(4096)
+	if st := m.Write(ctx, src, 0, 0, Slice{Id: id, Size: sliceSize, Len: sliceSize}, time.Now()); st != 0 {
+		t.Fatalf("write slice: %s", st)
+	}
+
+	countsBefore := make([]int64, 3)
+	for i, bean := range []interface{}{&node{}, &edge{}, &chunk{}} {
+		countsBefore[i], err = m.db.Count(bean)
+		if err != nil {
+			t.Fatalf("count rows before clone: %s", err)
+		}
+	}
+	trigger := fmt.Sprintf("CREATE TRIGGER fail_clone_ref_update BEFORE UPDATE ON %schunk_ref BEGIN SELECT RAISE(ABORT, 'forced clone ref update failure'); END", m.tablePrefix)
+	if _, err := m.db.Exec(trigger); err != nil {
+		t.Fatalf("create failure trigger: %s", err)
+	}
+
+	var count, total uint64
+	if st := m.Clone(ctx, RootInode, src, RootInode, "clone", CLONE_MODE_PRESERVE_ATTR, 0, 1, &count, &total); st == 0 {
+		t.Fatal("clone unexpectedly succeeded with a failing chunk_ref trigger")
+	}
+	for i, bean := range []interface{}{&node{}, &edge{}, &chunk{}} {
+		got, err := m.db.Count(bean)
+		if err != nil {
+			t.Fatalf("count rows after clone: %s", err)
+		}
+		if got != countsBefore[i] {
+			t.Fatalf("table %T rows after failed clone: got %d, want %d", bean, got, countsBefore[i])
+		}
+	}
+	if got := sqlSliceRefCount(t, m, id, sliceSize); got != 1 {
+		t.Fatalf("slice refs after failed clone: got %d, want 1", got)
+	}
+}
+
+type sqlStatementCountingLogger struct {
 	xormlog.ContextLogger
 	table  *regexp.Regexp
 	mu     sync.Mutex
 	counts map[string]int
 }
 
-func (l *insertCountingLogger) BeforeSQL(xormlog.LogContext) {}
+func (l *sqlStatementCountingLogger) BeforeSQL(xormlog.LogContext) {}
 
-func (l *insertCountingLogger) AfterSQL(ctx xormlog.LogContext) {
+func (l *sqlStatementCountingLogger) AfterSQL(ctx xormlog.LogContext) {
 	if m := l.table.FindStringSubmatch(ctx.SQL); m != nil && ctx.Err == nil {
 		l.mu.Lock()
 		l.counts[m[1]]++
@@ -553,7 +768,7 @@ func (l *insertCountingLogger) AfterSQL(ctx xormlog.LogContext) {
 	}
 }
 
-func (l *insertCountingLogger) IsShowSQL() bool { return true }
+func (l *sqlStatementCountingLogger) IsShowSQL() bool { return true }
 
 func TestSQLiteBatchCloneMultiRowInsert(t *testing.T) {
 	metaClient, err := newSQLMeta("sqlite3", path.Join(t.TempDir(), "jfs-batch-clone-insert.db"), testConfig())
@@ -623,7 +838,7 @@ func TestSQLiteBatchCloneMultiRowInsert(t *testing.T) {
 		}
 	}
 
-	counter := &insertCountingLogger{
+	counter := &sqlStatementCountingLogger{
 		ContextLogger: m.db.Logger(),
 		table:         regexp.MustCompile(`(?i)^\s*INSERT\s+INTO\s+\W?` + regexp.QuoteMeta(m.tablePrefix) + `(\w+)`),
 		counts:        make(map[string]int),

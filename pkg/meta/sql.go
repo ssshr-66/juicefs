@@ -1130,6 +1130,81 @@ func (m *dbMeta) batchUpdateChunkRefs(s *xorm.Session, chunkRefDeltas map[uint64
 	return nil
 }
 
+type chunkRefUpdateKey struct {
+	id   uint64
+	size uint32
+}
+
+func (m *dbMeta) batchUpdateChunkRefsBySize(s *xorm.Session, chunkRefDeltas map[chunkRefUpdateKey]int) error {
+	if len(chunkRefDeltas) == 0 {
+		return nil
+	}
+	keys := make([]chunkRefUpdateKey, 0, len(chunkRefDeltas))
+	for key, delta := range chunkRefDeltas {
+		if delta != 0 {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	slices.SortFunc(keys, func(a, b chunkRefUpdateKey) int {
+		if a.size < b.size {
+			return -1
+		}
+		if a.size > b.size {
+			return 1
+		}
+		if a.id < b.id {
+			return -1
+		}
+		if a.id > b.id {
+			return 1
+		}
+		return 0
+	})
+
+	// Each key uses two parameters in CASE and one more in the IN clause; the
+	// shared size predicate adds one parameter per batch.
+	maxParams := 999
+	if m.Name() == "mysql" || m.Name() == "postgres" {
+		maxParams = 65535
+	}
+	batchSize := min(m.getTxnBatchNum(), (maxParams-1)/3)
+	for sizeStart := 0; sizeStart < len(keys); {
+		sizeEnd := sizeStart + 1
+		for sizeEnd < len(keys) && keys[sizeEnd].size == keys[sizeStart].size {
+			sizeEnd++
+		}
+		for start := sizeStart; start < sizeEnd; start += batchSize {
+			end := min(start+batchSize, sizeEnd)
+			batch := keys[start:end]
+			var sb strings.Builder
+			args := make([]interface{}, 0, len(batch)*3+1)
+			fmt.Fprintf(&sb, "UPDATE %schunk_ref SET refs = refs + CASE ", m.tablePrefix)
+			for _, key := range batch {
+				sb.WriteString("WHEN chunkid = ? THEN ? ")
+				args = append(args, key.id, chunkRefDeltas[key])
+			}
+			sb.WriteString("ELSE 0 END WHERE chunkid IN (")
+			for i, key := range batch {
+				if i > 0 {
+					sb.WriteString(",")
+				}
+				sb.WriteString("?")
+				args = append(args, key.id)
+			}
+			sb.WriteString(") AND size = ?")
+			args = append(args, batch[0].size)
+			if _, err := s.Exec(append([]interface{}{sb.String()}, args...)...); err != nil {
+				return err
+			}
+		}
+		sizeStart = sizeEnd
+	}
+	return nil
+}
+
 func (m *dbMeta) genLog(ctx Context, s *xorm.Session, ns int64, op string, args ...any) {
 	if !m.getFormat().ChangeLog {
 		return
@@ -5725,15 +5800,16 @@ func (m *dbMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 						return err
 					}
 				}
-				// TODO: batch?
+				chunkRefDeltas := make(map[chunkRefUpdateKey]int)
 				for _, c := range cs {
 					for _, sli := range readSliceBuf(c.Slices) {
 						if sli.id > 0 {
-							if _, err := s.Exec(m.sqlConv("update chunk_ref set refs=refs+1 where chunkid = ? AND size = ?"), sli.id, sli.size); err != nil {
-								return err
-							}
+							chunkRefDeltas[chunkRefUpdateKey{id: sli.id, size: sli.size}]++
 						}
 					}
+				}
+				if err := m.batchUpdateChunkRefsBySize(s, chunkRefDeltas); err != nil {
+					return err
 				}
 			}
 		case TypeSymlink:
