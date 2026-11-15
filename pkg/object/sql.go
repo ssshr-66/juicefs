@@ -60,8 +60,35 @@ func (s *sqlStore) String() string {
 }
 
 func (s *sqlStore) Get(ctx context.Context, key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
+	// PostgreSQL's SUBSTR(bytea, start, count) arguments are 32-bit integers.
+	const maxSubstringArg = int64(1<<31 - 1)
+	if (off > 0 || limit > 0) && off >= 0 && off < maxSubstringArg {
+		var b struct {
+			Data []byte
+		}
+		var query string
+		var args []interface{}
+		if limit > 0 {
+			if limit > maxSubstringArg {
+				limit = maxSubstringArg
+			}
+			query = "SELECT SUBSTR(data, ?, ?) AS data FROM jfs_blob WHERE key = ?"
+			args = []interface{}{int32(off + 1), int32(limit), []byte(key)}
+		} else {
+			query = "SELECT SUBSTR(data, ?) AS data FROM jfs_blob WHERE key = ?"
+			args = []interface{}{int32(off + 1), []byte(key)}
+		}
+		ok, err := s.db.Context(ctx).SQL(query, args...).Get(&b)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, os.ErrNotExist
+		}
+		return io.NopCloser(bytes.NewBuffer(b.Data)), nil
+	}
+
 	var b = blob{Key: []byte(key)}
-	// TODO: range
 	ok, err := s.db.Context(ctx).Get(&b)
 	if err != nil {
 		return nil, err

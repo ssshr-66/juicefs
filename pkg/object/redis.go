@@ -132,6 +132,34 @@ func (t *redisStore) ListAll(ctx context.Context, prefix, marker string, followL
 				objs <- nil
 				return
 			}
+			var emptyIndexes []int
+			for idx, cmd := range cmds {
+				intCmd, ok := cmd.(*redis.IntCmd)
+				if !ok {
+					continue
+				}
+				size, err := intCmd.Result()
+				if err != nil {
+					objs <- nil
+					return
+				}
+				if size == 0 {
+					emptyIndexes = append(emptyIndexes, idx)
+				}
+			}
+
+			var existsCmds []*redis.IntCmd
+			if len(emptyIndexes) > 0 {
+				existsCmds = make([]*redis.IntCmd, len(cmds))
+				p := t.rdb.Pipeline()
+				for _, idx := range emptyIndexes {
+					existsCmds[idx] = p.Exists(ctx, keyList[start:end][idx])
+				}
+				if _, err := p.Exec(ctx); err != nil {
+					objs <- nil
+					return
+				}
+			}
 
 			now := time.Now()
 			for idx, cmd := range cmds {
@@ -142,7 +170,7 @@ func (t *redisStore) ListAll(ctx context.Context, prefix, marker string, followL
 						return
 					}
 					if size == 0 {
-						exist, err := t.rdb.Exists(ctx, keyList[start:end][idx]).Result()
+						exist, err := existsCmds[idx].Result()
 						if err != nil {
 							objs <- nil
 							return

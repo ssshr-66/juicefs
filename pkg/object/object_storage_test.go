@@ -48,6 +48,7 @@ import (
 	"github.com/volcengine/ve-tos-golang-sdk/v2/tos/enum"
 
 	"github.com/redis/go-redis/v9"
+	xormlog "xorm.io/xorm/log"
 )
 
 func get(s ObjectStorage, k string, off, limit int64, getters ...AttrGetter) (string, error) {
@@ -1206,6 +1207,116 @@ func TestSQLite(t *testing.T) {
 		t.Fatalf("create: %s", err)
 	}
 	testStorage(t, s)
+}
+
+type sqlQueryCaptureLogger struct {
+	xormlog.ContextLogger
+	queries []string
+}
+
+func (l *sqlQueryCaptureLogger) BeforeSQL(xormlog.LogContext) {}
+
+func (l *sqlQueryCaptureLogger) AfterSQL(ctx xormlog.LogContext) {
+	l.queries = append(l.queries, ctx.SQL)
+}
+
+func (l *sqlQueryCaptureLogger) IsShowSQL() bool { return true }
+
+func TestSQLiteGetRangeUsesSQLSubstring(t *testing.T) {
+	store, err := newSQLStore("sqlite3", filepath.Join(t.TempDir(), "range.db"), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := store.(*sqlStore)
+	defer s.db.Close()
+
+	payload := []byte{0x00, 'a', 0xe4, 0xb8, 0xad, 0xff, 'z'}
+	if err := s.Put(context.Background(), "binary", bytes.NewReader(payload)); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := &sqlQueryCaptureLogger{ContextLogger: s.db.Logger()}
+	s.db.SetLogger(logger)
+	defer s.db.SetLogger(logger.ContextLogger)
+
+	r, err := s.Get(context.Background(), "binary", 2, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, readErr := io.ReadAll(r)
+	closeErr := r.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if !bytes.Equal(got, payload[2:5]) {
+		t.Fatalf("got %v, want %v", got, payload[2:5])
+	}
+
+	if len(logger.queries) == 0 {
+		t.Fatal("Get did not execute a query")
+	}
+	if !strings.Contains(strings.ToLower(logger.queries[len(logger.queries)-1]), "substr(") {
+		t.Fatalf("partial Get should use SQL substring projection, got query: %s", logger.queries[len(logger.queries)-1])
+	}
+}
+
+func TestSQLiteGetRangeSemantics(t *testing.T) {
+	store, err := newSQLStore("sqlite3", filepath.Join(t.TempDir(), "range-semantics.db"), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := store.(*sqlStore)
+	defer s.db.Close()
+
+	payload := []byte{0x00, 'a', 0xe4, 0xb8, 0xad, 0xff, 'z'}
+	if err := s.Put(context.Background(), "binary", bytes.NewReader(payload)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(context.Background(), "empty", bytes.NewReader(nil)); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name   string
+		key    string
+		offset int64
+		limit  int64
+		want   []byte
+	}{
+		{name: "full", key: "binary", offset: 0, limit: -1, want: payload},
+		{name: "zero-limit-means-remainder", key: "binary", offset: 1, limit: 0, want: payload[1:]},
+		{name: "prefix", key: "binary", offset: 0, limit: 2, want: payload[:2]},
+		{name: "middle-byte-range", key: "binary", offset: 2, limit: 3, want: payload[2:5]},
+		{name: "negative-limit-means-remainder", key: "binary", offset: 2, limit: -1, want: payload[2:]},
+		{name: "range-truncated-at-eof", key: "binary", offset: 5, limit: 10, want: payload[5:]},
+		{name: "at-eof", key: "binary", offset: int64(len(payload)), limit: 1, want: []byte{}},
+		{name: "past-eof", key: "binary", offset: int64(len(payload) + 10), limit: 2, want: []byte{}},
+		{name: "max-int-offset", key: "binary", offset: 1<<63 - 1, limit: 1, want: []byte{}},
+		{name: "empty-object", key: "empty", offset: 0, limit: 1, want: []byte{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := s.Get(context.Background(), tc.key, tc.offset, tc.limit)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			got, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	if _, err := s.Get(context.Background(), "missing", 0, -1); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing key error: got %v, want %v", err, os.ErrNotExist)
+	}
 }
 
 func TestListPrefixBoundary(t *testing.T) {
